@@ -8,7 +8,9 @@
 The tool **a)** reads candidate passwords from a file or STDIN, **b)** derives the key, **c)** decrypts the keystore, and **d)** verifies the resulting address against the one recorded in the file. When found, the password is printed to the console and both password and private key are written to `pot.txt` for import into other Solana wallets.
 
 This tool is offered free of charge by Niels from [Wallet Recovery NL](https://walletrecovery.nl/). For professional assistance, I normally charge 10–15% of the wallet's value, only upon successful recovery.
-<img width="1905" height="394" alt="solflare-recover-solana" src="https://github.com/user-attachments/assets/7ea620bb-d859-4528-ab64-784d3a11124d" />
+
+<img width="1905" height="394" alt="solflare-recover-solana" src="https://github.com/user-attachments/assets/44d48410-5318-4b9a-b745-6f3804f3e508" />
+
 
 ## Requirements
 
