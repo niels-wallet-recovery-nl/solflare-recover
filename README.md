@@ -1,15 +1,18 @@
+
+
+```markdown
 # solflare-recover
 
-***Solflare-recover*** is a high performance (2500 password per second) password recovery tool for Solana legacy Solflare keystore wallet files. The tool is build using the Rust programming language for optimal multi-threaded fast password recovery.  
-The tool **a)** reads candidate passwords from either a file or STDIN, **b)** derives the key, **c)** decrypts the keystore, and checks the resulting address against the one recorded in the file. When the correct password is found it is printed to the console. In addition the password and exported private-key are written to the `pot.txt` file for easy importing in other Solana wallets. This tool is offered to you free of charge by Niels from [Wallet Recovery NL](https://walletrecovery.nl/).  
-In case you need help, feel free to reach out. I normally charge 10-15% of the wallets value, only upon successfull recovery of your funds.
+***Solflare-recover*** is a high-performance password recovery tool for legacy Solflare Solana keystore files. Built in Rust with multi-threading for optimal cracking speed (~2,500 passwords per second on 8 threads).
 
+The tool **a)** reads candidate passwords from a file or STDIN, **b)** derives the key, **c)** decrypts the keystore, and **d)** verifies the resulting address against the one recorded in the file. When found, the password is printed to the console and both password and private key are written to `pot.txt` for import into other Solana wallets.
+
+This tool is offered free of charge by Niels from [Wallet Recovery NL](https://walletrecovery.nl/). For professional assistance, I normally charge 10–15% of the wallet's value, only upon successful recovery.
 
 ## Requirements
-- If you just want to run the tool, download the Linux binary or Windows executable.
-If you want to compile the tool for optimal performance on your specific CPU you would need:
-- Rust (stable, 2021 edition) and openSSL development headers.
-In case you just want to run this tool, there are no additional requirement, just downlaod the executable or binary.
+
+- **Binary users:** No additional dependencies — download the Linux binary or Windows executable.
+- **Source builders:** Rust (stable, 2021 edition) and OpenSSL development headers.
 
 ## Build
 
@@ -18,25 +21,24 @@ cargo clean
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-`target-cpu=native` matters. Without it you can expect somewhat slower password cracking speed
+`target-cpu=native` matters. Without it, expect slower cracking speed.
 
+## Examples
 
-## Example use  
-Note that in the example commands below you should use `./solflare-recover` when on Linux/Mac, while using `solflare-recover.exe` when on Windows.
+Use `./solflare-recover` on Linux/macOS or `solflare-recover.exe` on Windows.
 
 ```bash
-# Single password `Solana123` to test against the test wallet 
+# Single password test
 echo 'Solana123' | solflare-recover.exe -f solflare-keystore-5f8p1fPaY8pEt6XhW7CxYdensmDCZUPZ2HygUzb8gtDC_Solana123.json
 
-# Try passwords from a file, use 8 threads
+# Multiple passwords with 8 threads
 solflare-recover.exe -f keystore.json -p passwords.txt -w 8 
 
-# Load passwords from STDIN from a file or a tool like hashcat
+# Load from STDIN (e.g., hashcat output)
 cat rockyou.txt | ./solflare-recover -f keystore.json -w 8
 
-# Recover password but do not export (-e) the privatekey
-solflare-recover.exe -f keystore.json -p passwords.txt -w 8 
- -e False
+# Disable private key export
+solflare-recover.exe -f keystore.json -p passwords.txt -w 8 -e false
 ```
 
 ## Options
@@ -44,58 +46,59 @@ solflare-recover.exe -f keystore.json -p passwords.txt -w 8
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-f, --file <PATH>` | Keystore JSON | `solflare-keystore.json` |
-| `-p, --file <PATH>` | Password text file | Optional, you can use STDIN |
+| `-p, --password-file <PATH>` | Password list file | Optional (STDIN) |
 | `-w, --workers <N>` | Worker threads | `1` |
-| `-e, --export <N>` | Export priv-key, default True | True/False |
-| `--target <ADDR>` | Base58 address to match, overriding the keystore | discovered |
-| `--list-targets` | Print every address-shaped string in the keystore, then exit | |
-| `--salt-mode <MODE>` | `raw` (Solflare) or `hex` (Web3 convention) | `raw` |
-| `--iv-hex <HEX>` | Override the IV, 32 hex chars | derived |
-| `--mac-check` | Enable the MAC fast-reject | off |
-| `--dump` | Print derived key, plaintext and addresses per password | off |
-| `-d, --debug` | Print the derived address per password | off |
-| `-V, --version` | Show version | |
-| `-h, --help` | Show help | |
+| `-e, --export-private-key <BOOL>` | Write private key to pot.txt | `true` |
+| `--target <ADDR>` | Override detected address | Auto-discovered |
+| `--list-targets` | List all address-shaped strings | — |
+| `--salt-mode <MODE>` | `raw` (Solflare) or `hex` (Web3) | `raw` |
+| `--iv-hex <HEX>` | Manual IV override (32 hex chars) | Derived |
+| `--mac-check` | Enable MAC validation | Off |
+| `--dump` | Print key/plaintext per password | Off |
+| `-d, --debug` | Print derived address per password | Off |
+| `-V, --version` | Show version | — |
+| `-h, --help` | Show help | — |
 
-`--dump` and `--debug` force `-w 1` so the output stays readable.
+`--dump` and `--debug` force `-w 1` for readable output.
 
-## Why this tool exists?
+## Why This Tool Exists
 
-Solflare keystores deviate from the Web3 Secret Storage convention and therefore needs a dedicated password recovery tool:
+Solflare keystores deviate from the Web3 Secret Storage convention:
 
-1. **The `cipher` field is wrong.** Keystores declare `"aes-128-ctr"` while the PBKDF2 output is 32 bytes. PyCryptodome (and Solflare itself) select the AES variant from the *key length*, so the effective cipher is AES-256-CTR. Honour the declared field and you decrypt to garbage.
-2. **The salt is not hex-decoded.** `salt` is a hex string, but it is fed to PBKDF2 as the raw ASCII bytes of that string, not as decoded bytes. A 64-byte salt, not 32.
-3. **There is no IV.** `cipherparams` carries a `counter` integer instead. It maps to the 128-bit AES-CTR initial block as a big-endian integer, right-aligned.
+1. **Wrong `cipher` field.** Keystores declare `"aes-128-ctr"` but PBKDF2 outputs 32 bytes. PyCryptodome selects AES variant from *key length*, making this effectively AES-256-CTR. Honoring the declaration produces garbage.
 
-This tool handles all three of these solflare specific deviation and was verifies against a inhouse reference Python implementation and using a teste wallet created on https://legacy.solflare.com.
+2. **Raw salt encoding.** The `salt` is a hex string but fed to PBKDF2 as raw ASCII bytes, not decoded. Result: 64 bytes, not 32.
+
+3. **No explicit IV.** `cipherparams` contains a `counter` integer mapped to the 128-bit AES-CTR initial block as big-endian, right-aligned.
+
+This tool handles all three Solflare-specific deviations. It was verified against a reference Python implementation and tested with wallets created on legacy.solflare.com.
 
 ## Performance
 
-Measured on the author's machine, `c=8192`, SHA-512, release build with
-`target-cpu=native`:
+Tested with `c=8192`, SHA-512, release build with `target-cpu=native`:
 
 | Threads | Throughput |
-|---------|-----------|
+|---------|------------|
 | 1 | ~350 pw/s |
 | 8 | ~2,500 pw/s |
 
-Scaling is close to linear. 
-
+Scaling is close to linear.
 
 ## Legal
-Use only on keystores you own or are authorised to recover. 
+
+Use only on keystores you own or are authorized to recover.
 
 ## License
+
 Apache License 2.0.
 
-## Buy me a beer
+## Buy Me a Beer
 
-If this saved you a wallet, donations are appreciated.
+If this helped you recover a wallet, donations are appreciated.
 
 | Chain | Address |
 |-------|---------|
 | Solana | `9DaPuWKExgtAamgo9gmXbyQXX2fvktPShHRWrYYvZVhQ` |
 | Bitcoin | `bc1qma6ag4vye3qp3h97jddnautqfj6y8xf7ggh9pd` |
 | Ethereum | `0x7C1e20d4c3bd294715Bad72cA82a6d1D28043CE0` |
-
-
+```
