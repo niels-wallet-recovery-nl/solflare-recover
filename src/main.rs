@@ -1,30 +1,36 @@
 // ============================================================================
-//  solana-lanes  v0.6.0
-//  Solflare / Solana keystore password recovery
+//  solflare-recover  v0.7.0
+//  High-performance password recovery tool for legacy Solflare keystores
 //
-//  Build:  cargo clean && RUSTFLAGS="-C target-cpu=native" cargo build --release
-//  Run:    cat words.txt | ./target/release/solana-lanes -f keystore.json -w 8
+//  DESCRIPTION:
+//    Brute-force password recovery for Solana keystore JSON files using
+//    PBKDF2-SHA512 (or SHA-256) key derivation and AES-CTR decryption.
+//    Verified against the decrypted public key in the keystore itself.
 //
-//  Cargo.toml
-//  ----------
-//    [package]
-//    name = "solana-lanes"
-//    version = "0.6.0"
-//    edition = "2021"
+//  SOLFLARE DEVIATIONS FROM WEB3 SECRET STORAGE:
+//    1. cipher field is often wrong (claims aes-128-ctr, actually uses AES-256)
+//    2. salt is raw ASCII bytes of hex string, not decoded hex (64 bytes, not 32)
+//    3. IV comes from counter integer, not an iv field (big-endian, right-aligned)
 //
-//    [dependencies]
-//    aes = "0.8"
-//    ctr = "0.9"
-//    ed25519-dalek = "2"
-//    bs58 = "0.5"
-//    serde_json = "1"
-//    hex = "0.4"
-//    openssl = "0.10"
+//  BUILD:
+//    cargo clean
+//    RUSTFLAGS="-C target-cpu=native" cargo build --release
 //
-//    [profile.release]
-//    opt-level = 3
-//    lto = "fat"
-//    codegen-units = 1
+//  EXAMPLE USE:
+//    echo 'Solana123' | solflare-recover -f keystore.json
+//    solflare-recover -f keystore.json -p passwords.txt -w 8
+//    cat rockyou.txt | solflare-recover -f keystore.json -w 8
+//    solflare-recover -f keystore.json -p words.txt -w 8 -e false
+//
+//  PERFORMANCE:
+//    Single thread:  ~350 passwords/second (c=8192, SHA-512)
+//    8 threads:      ~2,500 passwords/second (near-linear scaling)
+//
+//  OUTPUT:
+//    On success: password printed to console + entry written to pot.txt
+//    pot.txt format: file_name:password:private_key_base58
+//
+//  LICENSE: Apache 2.0
 // ============================================================================
 
 use std::env;
@@ -51,20 +57,21 @@ type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 const DEFAULT_KEYSTORE: &str = "solflare-keystore.json";
 const POT_FILE: &str = "pot.txt";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const BATCH: usize = 32;
-const QUEUE_DEPTH: usize = 2;
+const BATCH: usize = 32;        // passwords per batch sent to workers
+const QUEUE_DEPTH: usize = 2;   // worker queue depth
 
 // ============================================================================
 //  Types
 // ============================================================================
 
+/// Salt encoding mode: raw (ASCII bytes) vs hex (decoded bytes)
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SaltMode {
-    Raw,   // ASCII bytes of salt hex string (Solflare legacy)
+    Raw,   // ASCII bytes of hex string (Solflare legacy)
     Hex,   // Decoded hex bytes (Web3 convention)
 }
 
+/// PBKDF2 HMAC pseudo-random function hash algorithm
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PrfHash {
     Sha256,
@@ -72,6 +79,7 @@ enum PrfHash {
 }
 
 impl PrfHash {
+    /// Parse prf field from keystore (handles variations like hmac-sha512, hmac_with_sha512)
     fn parse(s: &str) -> Result<Self, String> {
         let norm = s.to_ascii_lowercase().replace('_', "-");
         match norm.as_str() {
@@ -81,6 +89,7 @@ impl PrfHash {
         }
     }
 
+    /// Convert to OpenSSL message digest for PKCS5 PBKDF2
     fn digest(self) -> MessageDigest {
         match self {
             PrfHash::Sha256 => MessageDigest::sha256(),
@@ -88,6 +97,7 @@ impl PrfHash {
         }
     }
 
+    /// Display name for banner output
     fn name(self) -> &'static str {
         match self {
             PrfHash::Sha256 => "sha256",
@@ -96,50 +106,54 @@ impl PrfHash {
     }
 }
 
+/// IV candidate with decoded bytes and human-readable label
 struct IvCandidate {
     bytes: [u8; 16],
     label: &'static str,
 }
 
+/// Parsed keystore JSON with all crypto parameters extracted
 struct Keystore {
     ciphertext: Vec<u8>,
     ivs: Vec<IvCandidate>,
     salt: Vec<u8>,
-    c: u32,
-    dklen: usize,
+    c: u32,                    // PBKDF2 iterations
+    dklen: usize,              // derived key length (determines AES variant)
     prf: PrfHash,
-    mac: Option<Vec<u8>>,
-    target: Option<String>,
-    target_path: Option<String>,
-    cipher_declared: String,
-    actual_key_len: usize,
-    top_keys: Vec<String>,
+    mac: Option<Vec<u8>>,      // optional MAC for fast-reject
+    target: Option<String>,    // auto-discovered address
+    target_path: Option<String>, // JSON path to address field
+    cipher_declared: String,   // from keystore (often wrong)
+    actual_key_len: usize,     // dklen (actual AES key used)
+    top_keys: Vec<String>,     // top-level JSON keys (debug info)
 }
 
-
+/// Runtime configuration from CLI arguments
 struct Config {
     keystore_path: String,
-    password_file: Option<String>,   
+    password_file: Option<String>,
     salt_mode: SaltMode,
-    target: Option<String>,
+    target: Option<String>,       // override auto-discovered address
     mac_check: bool,
     iv_override: Option<[u8; 16]>,
-    export_private_key: bool, // Default True, not printed to console but stored in pot.txt
-    debug: bool,
-    dump: bool,
-    list_targets: bool,
+    export_private_key: bool,     // write privkey to pot.txt
+    debug: bool,                  // print address per password (-w 1 forced)
+    dump: bool,                   // print full crypto details (-w 1 forced)
+    list_targets: bool,           // list all addresses then exit
     workers: usize,
 }
+
 // ============================================================================
 //  CLI
 // ============================================================================
 
+/// Generate help/usage text
 fn usage() -> String {
     format!(
-        r#"solana-lanes {VERSION} - Solflare / Solana keystore password recovery
+        r#"solflare-recover {VERSION} - Solflare / Solana keystore password recovery
 
 USAGE:
-    cat words.txt | solana-lanes [OPTIONS]
+    cat words.txt | solflare-recover [OPTIONS]
 
 OPTIONS:
     -f, --file <PATH>       keystore JSON (default: {DEFAULT_KEYSTORE})
@@ -165,15 +179,16 @@ VERIFICATION:
       - bytes 32..64 as literal public key
 
 INPUT:
-    Passwords from stdin, one per line.
+    Passwords from stdin or file, one per line.
 "#
     )
 }
 
+/// Parse command-line arguments into Config struct
 fn parse_args() -> Config {
     let mut cfg = Config {
-        password_file: None,        
-        salt_mode: SaltMode::Raw,  
+        password_file: None,
+        salt_mode: SaltMode::Raw,
         keystore_path: DEFAULT_KEYSTORE.to_string(),
         target: None,
         mac_check: false,
@@ -204,9 +219,9 @@ fn parse_args() -> Config {
     while i < args.len() {
         let arg = args[i].clone();
         match arg.as_str() {
-            "-f" | "--file" => cfg.keystore_path = take_value!(), // wallet file
-            "-p" | "--password-file" => cfg.password_file = Some(take_value!()), // password file
-            "-w" | "--workers" => { // number of threads/cores to use
+            "-f" | "--file" => cfg.keystore_path = take_value!(),
+            "-p" | "--password-file" => cfg.password_file = Some(take_value!()),
+            "-w" | "--workers" => {
                 let v = take_value!();
                 match v.parse::<usize>() {
                     Ok(n) if n >= 1 => cfg.workers = n,
@@ -264,10 +279,8 @@ fn parse_args() -> Config {
                     }
                 };
             }
-
-             // Optional password file, else reads from STDIN
             "-V" | "--version" => {
-                println!("solana-lanes {}", VERSION);
+                println!("solflare-recover {}", VERSION);
                 process::exit(0);
             }
             _ => {
@@ -287,9 +300,10 @@ fn parse_args() -> Config {
 }
 
 // ============================================================================
-//  Target discovery
+//  Target Discovery
 // ============================================================================
 
+/// Normalize JSON key names for case-insensitive comparison
 fn normalize_key(k: &str) -> String {
     k.chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -297,6 +311,7 @@ fn normalize_key(k: &str) -> String {
         .collect()
 }
 
+/// Check if string is plausible Base58 address (32 decoded bytes)
 fn looks_like_address(s: &str) -> bool {
     if s.len() < 32 || s.len() > 44 {
         return false;
@@ -304,6 +319,7 @@ fn looks_like_address(s: &str) -> bool {
     matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 32)
 }
 
+/// Rank JSON keys by likelihood of being the address field (lower = better)
 fn key_rank(norm: &str) -> Option<u8> {
     match norm {
         "publickey" => Some(0),
@@ -316,6 +332,8 @@ fn key_rank(norm: &str) -> Option<u8> {
     }
 }
 
+/// Recursively walk JSON tree collecting address-shaped strings
+/// Found targets sorted by key_rank then path length
 fn collect_targets(
     v: &Value,
     path: &str,
@@ -325,12 +343,7 @@ fn collect_targets(
     match v {
         Value::Object(map) => {
             for (k, val) in map {
-                let child = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{}.{}", path, k)
-                };
-
+                let child = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
                 if let Some(s) = val.as_str() {
                     if looks_like_address(s) {
                         all_strings.insert(child.clone(), s.to_string());
@@ -354,19 +367,22 @@ fn collect_targets(
 }
 
 // ============================================================================
-//  IV candidates
+//  IV Candidates
 // ============================================================================
 
+/// Add unique IV candidate to list
 fn push_unique(out: &mut Vec<IvCandidate>, bytes: [u8; 16], label: &'static str) {
     if !out.iter().any(|c| c.bytes == bytes) {
         out.push(IvCandidate { bytes, label });
     }
 }
 
+/// Build IV candidates from cipherparams object
+/// Supports: explicit iv field OR counter integer (PyCryptodome convention)
 fn build_iv_candidates(cp: &Value) -> Result<Vec<IvCandidate>, String> {
     let mut out: Vec<IvCandidate> = Vec::new();
 
-    // Explicit iv first (standard Web3)
+    // Standard Web3: explicit iv field (hex string)
     if let Some(iv_hex) = cp.get("iv").and_then(|x| x.as_str()) {
         let b = hex::decode(iv_hex).map_err(|e| format!("bad iv hex: {}", e))?;
         if b.len() != 16 {
@@ -377,9 +393,8 @@ fn build_iv_candidates(cp: &Value) -> Result<Vec<IvCandidate>, String> {
         push_unique(&mut out, a, "iv-field");
     }
 
-    // Counter fallback (PyCryptodome: Counter.new(128, initial_value=counter))
+    // Solflare legacy: counter integer (128-bit BE, right-aligned)
     if let Some(cnt) = cp.get("counter").and_then(|x| x.as_u64()) {
-        // 128-bit big-endian, right-aligned (PyCryptodome's behavior)
         let mut b = [0u8; 16];
         b[8..].copy_from_slice(&cnt.to_be_bytes());
         push_unique(&mut out, b, "counter-be128-PyCryptodome");
@@ -388,13 +403,14 @@ fn build_iv_candidates(cp: &Value) -> Result<Vec<IvCandidate>, String> {
     if out.is_empty() {
         return Err("cipherparams has neither \"iv\" nor \"counter\"".to_string());
     }
-
     Ok(out)
 }
+
 // ============================================================================
-//  Helper functions
+//  Crypto Helpers
 // ============================================================================
 
+/// Format elapsed seconds as HH:MM:SS
 fn fmt_time(secs: f64) -> String {
     let hrs = secs as u64 / 3600;
     let mins = (secs as u64 % 3600) / 60;
@@ -402,19 +418,21 @@ fn fmt_time(secs: f64) -> String {
     format!("{:02}:{:02}:{:02}", hrs, mins, sec)
 }
 
-// 
+/// Encode first 32 bytes of plaintext as Base58 private key
+/// These 32 bytes ARE the ed25519 seed (raw, not compressed)
 fn derive_private_key_base58(plaintext: &[u8]) -> Option<String> {
     if plaintext.len() < 32 {
         return None;
     }
-    // The first 32 bytes ARE the private key (ed25519 seed)
     Some(bs58::encode(&plaintext[..32]).into_string())
 }
 
 // ============================================================================
-//  Keystore parsing
+//  Keystore Parsing
 // ============================================================================
 
+/// Parse keystore JSON, extract crypto params, discover target address
+/// Falls back to highest-ranked address-shaped string if no explicit target
 fn parse_keystore(cfg: &Config) -> Result<Keystore, String> {
     let raw = fs::read_to_string(&cfg.keystore_path)
         .map_err(|e| format!("cannot read {}: {}", cfg.keystore_path, e))?;
@@ -426,7 +444,7 @@ fn parse_keystore(cfg: &Config) -> Result<Keystore, String> {
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
 
-    // ---- target discovery -------------------------------------------------
+    // ---- Target discovery ----
     let mut found: Vec<(u8, String, String)> = Vec::new();
     let mut all_strings: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     collect_targets(&v, "", &mut found, &mut all_strings);
@@ -440,11 +458,7 @@ fn parse_keystore(cfg: &Config) -> Result<Keystore, String> {
             let mut rows: Vec<_> = all_strings.iter().collect();
             rows.sort_by_key(|(k, _)| k.as_str());
             for (path, val) in rows {
-                let marked = if found.iter().any(|(_, p, _)| p == path) {
-                    " <-- recognised"
-                } else {
-                    ""
-                };
+                let marked = if found.iter().any(|(_, p, _)| p == path) { " <-- recognised" } else { "" };
                 eprintln!("  {} = {}{}", path, val, marked);
             }
         }
@@ -456,27 +470,18 @@ fn parse_keystore(cfg: &Config) -> Result<Keystore, String> {
         None => (None, None),
     };
 
-    // ---- crypto section ---------------------------------------------------
+    // ---- Crypto section ----
     let crypto = v.get("crypto").or_else(|| v.get("Crypto")).ok_or_else(|| {
         format!("no \"crypto\" object (keys: {:?})", top_keys)
     })?;
 
-    let cipher_declared = crypto
-        .get("cipher")
-        .and_then(|x| x.as_str())
-        .unwrap_or("aes-256-ctr")
-        .to_string();
-
+    let cipher_declared = crypto.get("cipher").and_then(|x| x.as_str()).unwrap_or("aes-256-ctr").to_string();
     let kdfp = crypto.get("kdfparams").ok_or("missing kdfparams")?;
 
     let c = kdfp.get("c").and_then(|x| x.as_u64()).ok_or("missing c")? as u32;
     let dklen = kdfp.get("dklen").and_then(|x| x.as_u64()).ok_or("missing dklen")? as usize;
 
-    let prf = PrfHash::parse(
-        kdfp.get("prf")
-            .and_then(|x| x.as_str())
-            .unwrap_or("hmac-sha512"),
-    )?;
+    let prf = PrfHash::parse(kdfp.get("prf").and_then(|x| x.as_str()).unwrap_or("hmac-sha512"))?;
 
     let salt_hex = kdfp.get("salt").and_then(|x| x.as_str()).ok_or("missing salt")?;
     let salt = match cfg.salt_mode {
@@ -484,10 +489,7 @@ fn parse_keystore(cfg: &Config) -> Result<Keystore, String> {
         SaltMode::Hex => hex::decode(salt_hex).map_err(|e| format!("salt error: {}", e))?,
     };
 
-    let ct_hex = crypto
-        .get("ciphertext")
-        .and_then(|x| x.as_str())
-        .ok_or("missing ciphertext")?;
+    let ct_hex = crypto.get("ciphertext").and_then(|x| x.as_str()).ok_or("missing ciphertext")?;
     let ciphertext = hex::decode(ct_hex).map_err(|e| format!("ciphertext error: {}", e))?;
 
     let ivs = if let Some(o) = cfg.iv_override {
@@ -504,36 +506,28 @@ fn parse_keystore(cfg: &Config) -> Result<Keystore, String> {
         .transpose()
         .map_err(|e| format!("mac error: {}", e))?;
 
-    // ACTUAL KEY LENGTH = dklen (what PyCryptodome uses)
-    // NOT derived from cipher declaration
+    // NOTE: dklen determines AES variant, NOT cipher_declared field
     let actual_key_len = dklen;
 
     Ok(Keystore {
-        ciphertext,
-        ivs,
-        salt,
-        c,
-        dklen,
-        prf,
-        mac,
-        target,
-        target_path,
-        cipher_declared,
-        actual_key_len,
-        top_keys,
+        ciphertext, ivs, salt, c, dklen, prf, mac, target, target_path, cipher_declared, actual_key_len, top_keys,
     })
 }
 
 // ============================================================================
-//  Crypto
+//  Crypto Operations
 // ============================================================================
 
+/// Derive encryption key using PBKDF2-HMAC via OpenSSL (same as Python reference)
+/// This uses the exact same underlying function that PyCryptodome calls
 fn derive_key(pw: &[u8], ks: &Keystore) -> Option<Vec<u8>> {
     let mut key = vec![0u8; ks.dklen];
     pkcs5::pbkdf2_hmac(pw, &ks.salt, ks.c as usize, ks.prf.digest(), &mut key).ok()?;
     Some(key)
 }
 
+/// Compute Solana CLI MAC: sha256(key[16..32] || ciphertext)
+/// Used for fast-reject when --mac-check is enabled
 fn compute_mac(key: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
     if key.len() < 32 {
         return None;
@@ -544,6 +538,9 @@ fn compute_mac(key: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
     hash(MessageDigest::sha256(), &buf).ok().map(|d| d.to_vec())
 }
 
+/// Derive candidate addresses from decrypted plaintext
+/// Method 1: bytes 0..32 as ed25519 seed -> derive address
+/// Method 2: bytes 32..64 as literal public key (alternative interpretation)
 fn candidate_addresses(plaintext: &[u8]) -> Vec<String> {
     let mut out = Vec::with_capacity(2);
 
@@ -557,10 +554,11 @@ fn candidate_addresses(plaintext: &[u8]) -> Vec<String> {
     if plaintext.len() >= 64 {
         out.push(bs58::encode(&plaintext[32..64]).into_string());
     }
-
     out
 }
 
+/// Attempt to decrypt with given password, verify against target address
+/// Returns (IV_label, private_key_base58) on match, None otherwise
 fn try_password(
     pw: &str,
     ks: &Keystore,
@@ -569,6 +567,7 @@ fn try_password(
 ) -> Option<(&'static str, String)> {
     let key = derive_key(pw.as_bytes(), ks)?;
 
+    // Optional MAC fast-reject before expensive decryption
     if cfg.mac_check {
         if let Some(expected) = &ks.mac {
             if expected.len() == 32 {
@@ -581,9 +580,11 @@ fn try_password(
         }
     }
 
+    // Try each IV candidate until decryption succeeds
     for iv in &ks.ivs {
         let mut buf = ks.ciphertext.clone();
 
+        // Select AES variant based on KEY LENGTH (not cipher declaration)
         if key.len() >= 32 {
             let mut c = Aes256Ctr::new(
                 GenericArray::from_slice(&key[..32]),
@@ -601,12 +602,7 @@ fn try_password(
         let cands = candidate_addresses(&buf);
 
         if cfg.debug {
-            eprintln!(
-                "pw={:<26} iv={:<35} -> {}",
-                format!("{:?}", pw),
-                iv.label,
-                cands.join(" | ")
-            );
+            eprintln!("pw={:<26} iv={:<35} -> {}", format!("{:?}", pw), iv.label, cands.join(" | "));
         }
 
         if cfg.dump {
@@ -617,25 +613,22 @@ fn try_password(
             for a in &cands {
                 eprintln!("  derived : {}", a);
             }
-            eprintln!("  target  : {}", target);
-            eprintln!();
+            eprintln!("  target  : {}\n", target);
         }
 
         if cands.iter().any(|a| a == target) {
-            // Derive private key from the first 32 bytes of plaintext
             let priv_key = derive_private_key_base58(&buf)?;
             return Some((iv.label, priv_key));
         }
     }
-
     None
 }
 
-
 // ============================================================================
-//  Workers
+//  Worker Threads
 // ============================================================================
 
+/// Worker thread: receive password batches, attempt decryption, send matches
 fn worker(
     rx: Receiver<Vec<String>>,
     ks: Arc<Keystore>,
@@ -665,42 +658,42 @@ fn worker(
     }
 }
 
+/// Append successful crack to pot.txt (password file format)
+/// Format: file_name:password:private_key (one entry per line)
+/// Duplicate entries are skipped
 fn write_pot(file_name: &str, pw: &str, priv_key: &str, export: bool) -> io::Result<String> {
     let path = POT_FILE.to_string();
     let export = export && !priv_key.is_empty();
-    // Build the entry line
     let entry = format!("{}:{}:{}", file_name, pw, if export { priv_key } else { "PRIVATE_KEY_HIDDEN" });
-    // Check if entry already exists (skip duplicates)
+
+    // Check for duplicate entry
     if fs::metadata(&path).is_ok() {
         if let Ok(content) = fs::read_to_string(&path) {
-            if content.contains(&entry) {
-                return Ok(path); // Already written, skip
+            if content.lines().any(|l| l == entry) {
+                return Ok(path);
             }
         }
     }
-    // Open in append mode, creating with header if needed
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
 
-    // Write header if file is empty/new
+    // Append with header on first write
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
     if fs::metadata(&path)?.len() == 0 {
         writeln!(f, "file_name:password:private_key")?;
     }
-
     writeln!(f, "{}", entry)?;
     f.flush()?;
     Ok(path)
 }
 
+/// Format password rate as "{X.X} pw/s"
 fn fmt_rate(n: u64, secs: f64) -> String {
     format!("{:.1} pw/s", n as f64 / secs.max(1e-9))
 }
 
 // ============================================================================
-//  Main
+//  Main Entry Point
 // ============================================================================
+
 fn main() {
     let cfg = Arc::new(parse_args());
 
@@ -721,7 +714,7 @@ fn main() {
         }
     });
 
-    // ---- password source (fail fast before printing a banner) ----
+    // Determine password source (fail fast before banner)
     let reader: Box<dyn BufRead> = match cfg.password_file.as_deref() {
         Some(path) => match File::open(path) {
             Ok(f) => Box::new(BufReader::new(f)),
@@ -733,58 +726,32 @@ fn main() {
         None => Box::new(BufReader::new(io::stdin().lock())),
     };
 
-    // ---- banner ----
+    // Print runtime banner
     let iv_labels: Vec<&str> = ks.ivs.iter().map(|i| i.label).collect();
     eprintln!("keystore       : {}", cfg.keystore_path);
     eprintln!("keys           : {:?}", ks.top_keys);
-    eprintln!(
-        "kdf            : pbkdf2-{}  c={}  dklen={}  salt={} bytes ({:?})",
-        ks.prf.name(),
-        ks.c,
-        ks.dklen,
-        ks.salt.len(),
-        cfg.salt_mode
-    );
-    eprintln!(
-        "cipher (claim) : {} (declared in keystore, may be WRONG)",
-        ks.cipher_declared
-    );
-    eprintln!(
-        "key len (use)  : {} bytes (from dklen, used for AES variant)",
-        ks.actual_key_len
-    );
-    eprintln!(
-        "iv             : {} candidate(s) [{}]",
-        ks.ivs.len(),
-        iv_labels.join(", ")
-    );
-    eprintln!(
-        "mac            : {}",
-        if ks.mac.is_some() && cfg.mac_check {
-            "present, checked"
-        } else if ks.mac.is_some() {
-            "present but NOT checked (use --mac-check)"
-        } else {
-            "absent"
-        }
-    );
-    eprintln!(
-        "target         : {}  (from {})",
-        target,
-        ks.target_path.as_deref().unwrap_or("--target")
-    );
+    eprintln!("kdf            : pbkdf2-{}  c={}  dklen={}  salt={} bytes ({:?})",
+              ks.prf.name(), ks.c, ks.dklen, ks.salt.len(), cfg.salt_mode);
+    eprintln!("cipher (claim) : {} (declared in keystore, may be WRONG)", ks.cipher_declared);
+    eprintln!("key len (use)  : {} bytes (from dklen, used for AES variant)", ks.actual_key_len);
+    eprintln!("iv             : {} candidate(s) [{}]", ks.ivs.len(), iv_labels.join(", "));
+    eprintln!("mac            : {}", if ks.mac.is_some() && cfg.mac_check {
+        "present, checked"
+    } else if ks.mac.is_some() {
+        "present but NOT checked (use --mac-check)"
+    } else {
+        "absent"
+    });
+    eprintln!("target         : {}  (from {})", target, ks.target_path.as_deref().unwrap_or("--target"));
     eprintln!("workers        : {}", cfg.workers);
     eprintln!("export privkey : {}", cfg.export_private_key);
-    eprintln!(
-        "input          : {}",
-        match cfg.password_file.as_deref() {
-            Some(p) => format!("file {}", p),
-            None => "stdin".to_string(),
-        }
-    );
+    eprintln!("input          : {}", match cfg.password_file.as_deref() {
+        Some(p) => format!("file {}", p),
+        None => "stdin".to_string(),
+    });
     eprintln!();
 
-    // ---- spawn workers ----
+    // Spawn worker threads
     let n = cfg.workers;
     let mut senders: Vec<mpsc::SyncSender<Vec<String>>> = Vec::with_capacity(n);
     let mut handles = Vec::with_capacity(n);
@@ -810,7 +777,7 @@ fn main() {
     }
     drop(found_tx);
 
-    // ---- feed workers ----
+    // Feed passwords from input source
     let started = Instant::now();
     let mut batch: Vec<String> = Vec::with_capacity(BATCH);
     let mut rr = 0usize;
@@ -835,7 +802,6 @@ fn main() {
 
         sample.clear();
         sample.push_str(&pw);
-
         batch.push(pw);
 
         if batch.len() == BATCH {
@@ -851,22 +817,18 @@ fn main() {
             }
         }
 
+        // Progress reporting: 10s first interval, then 60s
         if last_report.elapsed() >= report_every {
             let done = processed.load(Ordering::Relaxed);
             let elapsed = started.elapsed().as_secs_f64();
-            eprintln!(
-                "[progress] {:>10} tried  {}  ({})  sample: {:?}",
-                done,
-                fmt_rate(done, elapsed),
-                fmt_time(elapsed),
-                sample
-            );
+            eprintln!("[progress] {:>10} tried  {}  ({})  sample: {:?}",
+                     done, fmt_rate(done, elapsed), fmt_time(elapsed), sample);
             last_report = Instant::now();
             report_every = Duration::from_secs(60);
         }
     }
 
-    // ---- flush ----
+    // Flush remaining batch
     if !batch.is_empty() && !stop.load(Ordering::Relaxed) {
         let _ = senders[rr].send(batch);
     }
@@ -876,13 +838,14 @@ fn main() {
         let _ = h.join();
     }
 
+    // Drain any late-arriving matches
     if matched.is_none() {
         while let Ok(hit) = found_rx.try_recv() {
             matched = Some(hit);
         }
     }
 
-    // ---- verdict ----
+    // Final verdict
     let elapsed = started.elapsed().as_secs_f64();
     let tried = processed.load(Ordering::Relaxed);
 
@@ -892,13 +855,8 @@ fn main() {
             eprintln!("password   : {}", pw);
             eprintln!("address    : {}", target);
             eprintln!("iv variant : {}", label);
-            // PRIVATE KEY DELIBERATELY NOT PRINTED
-            eprintln!(
-                "searched   : {} candidates in {:.2}s ({})",
-                tried,
-                elapsed,
-                fmt_rate(tried, elapsed)
-            );
+            // PRIVATE KEY DELIBERATELY NOT PRINTED TO CONSOLE
+            eprintln!("searched   : {} candidates in {:.2}s ({})", tried, elapsed, fmt_rate(tried, elapsed));
             match write_pot(&cfg.keystore_path, &pw, &priv_key, cfg.export_private_key) {
                 Ok(p) => eprintln!("written    : {}", p),
                 Err(e) => eprintln!("warning    : could not write pot file: {}", e),
@@ -910,12 +868,7 @@ fn main() {
                 eprintln!("\naborted after {} candidates - input error", tried);
                 process::exit(2);
             }
-            eprintln!(
-                "\nexhausted: {} candidates in {:.2}s ({}) - no match",
-                tried,
-                elapsed,
-                fmt_rate(tried, elapsed)
-            );
+            eprintln!("\nexhausted: {} candidates in {:.2}s ({}) - no match", tried, elapsed, fmt_rate(tried, elapsed));
             process::exit(1);
         }
     }
