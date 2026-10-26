@@ -1,6 +1,3 @@
-
-
-```markdown
 # solflare-recover
 
 ***Solflare-recover*** is a high-performance password recovery tool for legacy Solflare Solana keystore files. Built in Rust with multi-threading for optimal cracking speed (~2,500 passwords per second on 8 threads).
