@@ -1,9 +1,10 @@
 // ============================================================================
 //  solflare-recover  v0.7.0
 //  High-performance password recovery tool for legacy Solflare keystores
+//  This tool is provided to you Free of change by Niels from Wallet Recovery NL
 //
 //  DESCRIPTION:
-//    Brute-force password recovery for Solana keystore JSON files using
+//    Brute-force password recovery for Solana solflare legacy keystore JSON files using
 //    PBKDF2-SHA512 (or SHA-256) key derivation and AES-CTR decryption.
 //    Verified against the decrypted public key in the keystore itself.
 //
@@ -833,7 +834,6 @@ fn main() {
         let _ = senders[rr].send(batch);
     }
     drop(senders);
-
     for h in handles {
         let _ = h.join();
     }
@@ -845,7 +845,7 @@ fn main() {
         }
     }
 
-    // Final verdict
+    // Final verdict, update statistics on cracking progress and speed
     let elapsed = started.elapsed().as_secs_f64();
     let tried = processed.load(Ordering::Relaxed);
 
@@ -855,7 +855,7 @@ fn main() {
             eprintln!("password   : {}", pw);
             eprintln!("address    : {}", target);
             eprintln!("iv variant : {}", label);
-            // PRIVATE KEY DELIBERATELY NOT PRINTED TO CONSOLE
+            // PRIVATE KEY DELIBERATELY NOT PRINTED TO CONSOLE SINCE THIS WOULD BE A SECURITY RISK
             eprintln!("searched   : {} candidates in {:.2}s ({})", tried, elapsed, fmt_rate(tried, elapsed));
             match write_pot(&cfg.keystore_path, &pw, &priv_key, cfg.export_private_key) {
                 Ok(p) => eprintln!("written    : {}", p),
