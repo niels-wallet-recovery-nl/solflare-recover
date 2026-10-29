@@ -39,6 +39,9 @@ cat rockyou.txt | ./solflare-recover -f keystore.json -w 8
 
 # Disable private key export
 solflare-recover.exe -f keystore.json -p passwords.txt -w 8 -e false
+
+# Run benchmark to test the speed by repeatedly printing some dummy intext 100k times
+time printf 'HelloWorld\n%.0s' {1..100000} | time printf 'HellaWorld\n%.0s' {1..200000} | 
 ```
 
 ## Options
@@ -75,7 +78,7 @@ This tool handles all three Solflare-specific deviations. It was verified agains
 
 ## Performance
 
-Tested with `c=8192`, SHA-512, release build with `target-cpu=native`:
+Tested with `c=8192`, SHA-512, release build with `target-cpu=native` on a 8 core laptop:
 
 | Threads | Throughput |
 |---------|------------|
