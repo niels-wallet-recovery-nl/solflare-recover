@@ -794,7 +794,7 @@ fn main() {
     let mut report_every = Duration::from_secs(10);
     let mut matched: Option<(String, &'static str, String)> = None;
     let mut read_failed = false;
-    let sample = String::new();
+    let mut sample = String::new();
 
     for line in reader.lines() {
         let mut pw = match line {
@@ -806,11 +806,14 @@ fn main() {
             }
         };
 
-        scrub(&mut pw);              // <-- kills \r and \n wherever they hide
-
+        scrub(&mut pw);                // strip CR/LF and Unicode line separators anywhere in the line
         if pw.is_empty() {
-            continue;                // blank / CR-only lines are skipped, as before
+            continue;                  // blank / CR-only lines are skipped
         }
+
+        sample.clear();
+        sample.push_str(&pw);
+        batch.push(pw);
 
         if batch.len() == BATCH {
             let b = std::mem::replace(&mut batch, Vec::with_capacity(BATCH));
