@@ -408,8 +408,16 @@ fn build_iv_candidates(cp: &Value) -> Result<Vec<IvCandidate>, String> {
 }
 
 // ============================================================================
-//  Crypto Helpers
+//  Helpers
 // ============================================================================
+
+/// Strip every CR and LF *anywhere* in the line, not merely at the ends.
+/// Survives concatenated CRLF wordlists where stray '\r' sits mid-line.
+fn scrub(s: &mut String) {
+    // Strip ASCII and Unicode line separators that can corrupt passwords from mixed-format wordlists.
+    // Includes CR/LF, VT/FF, C0 control separators (file/group/record/unit), NEL, and Unicode line/para breaks.
+    s.retain(|c| !matches!(c, '\r' | '\n' | '\u{0b}' | '\u{0c}' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}'));
+}
 
 /// Format elapsed seconds as HH:MM:SS
 fn fmt_time(secs: f64) -> String {
@@ -786,10 +794,10 @@ fn main() {
     let mut report_every = Duration::from_secs(10);
     let mut matched: Option<(String, &'static str, String)> = None;
     let mut read_failed = false;
-    let mut sample = String::new();
+    let sample = String::new();
 
     for line in reader.lines() {
-        let pw = match line {
+        let mut pw = match line {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("input error: {}", e);
@@ -797,13 +805,12 @@ fn main() {
                 break;
             }
         };
-        if pw.is_empty() {
-            continue;
-        }
 
-        sample.clear();
-        sample.push_str(&pw);
-        batch.push(pw);
+        scrub(&mut pw);              // <-- kills \r and \n wherever they hide
+
+        if pw.is_empty() {
+            continue;                // blank / CR-only lines are skipped, as before
+        }
 
         if batch.len() == BATCH {
             let b = std::mem::replace(&mut batch, Vec::with_capacity(BATCH));
