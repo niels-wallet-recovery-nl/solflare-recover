@@ -14,14 +14,81 @@ This tool is offered free of charge by Niels from [Wallet Recovery NL](https://w
 - **Binary users:** No additional dependencies — download the Linux binary or Windows executable.
 - **Source builders:** Rust (stable, 2021 edition) and OpenSSL development headers.
 
-## Build
+## Build from Source
 
-```bash
-cargo clean
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-```
+Prebuilt binaries require no dependencies. Building from source requires Rust and, on Windows, Perl.
 
-`target-cpu=native` matters. Without it, expect slower cracking speed.
+<details>
+<summary><b>Linux</b></summary>
+
+<br>
+
+- Install Rust and Cargo: <https://www.rust-lang.org/tools/install>
+- Install OpenSSL development headers and `pkg-config`:
+
+  ```bash
+  # Debian / Ubuntu / Mint
+  sudo apt install -y build-essential pkg-config libssl-dev
+
+  # Fedora / RHEL
+  sudo dnf install -y gcc pkgconf-pkg-config openssl-devel
+
+  # Arch / Manjaro
+  sudo pacman -S --needed base-devel pkgconf openssl
+  ```
+
+- Set the `openssl` dependency in `Cargo.toml`:
+
+  ```toml
+  openssl = "0.10"
+  ```
+
+- Clone and build:
+
+  ```bash
+  git clone https://github.com/niels-wallet-recovery-nl/solflare-recover.git
+  cd solflare-recover
+  RUSTFLAGS="-C target-cpu=native" cargo build --release
+  ```
+
+- Binary: `target/release/solflare-recover`
+
+</details>
+
+<details>
+<summary><b>Windows</b></summary>
+
+<br>
+
+- Install the Microsoft C++ Build Tools: <https://visualstudio.microsoft.com/visual-cpp-build-tools/> (select "Desktop development with C++")
+- Install Rust and Cargo: <https://www.rust-lang.org/tools/install>
+- Install Strawberry Perl: <https://strawberryperl.com/>
+- Restart the computer
+- Add Strawberry Perl to your user `PATH` if the installer did not:
+
+  ```
+  C:\Strawberry\perl\bin
+  C:\Strawberry\c\bin
+  ```
+
+- Set the `openssl` dependency in `Cargo.toml`:
+
+  ```toml
+  openssl = { version = "0.10", features = ["vendored"] }
+  ```
+
+- Clone and build:
+
+  ```powershell
+  git clone https://github.com/niels-wallet-recovery-nl/solflare-recover.git
+  cd solflare-recover
+  $env:RUSTFLAGS="-C target-cpu=native"
+  cargo build --release
+  ```
+
+- Binary: `target\release\solflare-recover.exe`
+
+</details>
 
 ## Examples
 
