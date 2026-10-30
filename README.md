@@ -31,6 +31,9 @@ Use `./solflare-recover` on Linux/macOS or `solflare-recover.exe` on Windows.
 # Single password test
 echo 'Solana123' | solflare-recover.exe -f solflare-keystore-5f8p1fPaY8pEt6XhW7CxYdensmDCZUPZ2HygUzb8gtDC_Solana123.json
 
+# Run benchmark on Linux to test the speed by repeatedly printing some dummy text 100k times. On Windows use subsystems for linux.
+time printf 'HelloWorld\n%.0s' {1..100000} | solflare-recover.exe -f solflare-keystore-5f8p1fPaY8pEt6XhW7CxYdensmDCZUPZ2HygUzb8gtDC_Solana123.json
+
 # Multiple passwords with 8 threads
 solflare-recover.exe -f keystore.json -p passwords.txt -w 8 
 
@@ -40,8 +43,7 @@ cat rockyou.txt | ./solflare-recover -f keystore.json -w 8
 # Disable private key export
 solflare-recover.exe -f keystore.json -p passwords.txt -w 8 -e false
 
-# Run benchmark to test the speed by repeatedly printing some dummy intext 100k times
-time printf 'HelloWorld\n%.0s' {1..100000} | time printf 'HellaWorld\n%.0s' {1..200000} | 
+
 ```
 
 ## Options
